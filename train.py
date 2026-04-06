@@ -344,7 +344,7 @@ def eval_ce_only(
     return total / max(n, 1)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="T2 V1 world-model training")
     p.add_argument(
         "--checkpoint_path",
@@ -359,11 +359,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--pretrained", type=str, default="microsoft/DialoGPT-small")
     p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+    if argv is None:
+        # Notebook / IPython: sys.argv has e.g. -f kernel.json — do not parse it.
+        argv = sys.argv[1:] if __name__ == "__main__" else []
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
     abs_ckpt = os.path.abspath(args.checkpoint_path)
     if abs_ckpt.startswith("/content/drive/") and not os.path.isdir(
         "/content/drive/MyDrive"
