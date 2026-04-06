@@ -26,7 +26,12 @@ N_INNER: int = N_EMBD * 4  # 3072 — GPT-2 block MLP hidden (also 4× n_embd)
 # RSM — slot memory (count is fixed; vector dim comes from backbone at runtime)
 # ---------------------------------------------------------------------------
 
-RSM_N_SLOTS: int = 1024
+# ERG write/think/read are O(batch × n_slots) per token per layer. 1024 slots ×
+# 1024 tokens × 12 layers blows VRAM on typical Colab/A100 training; 256 fits.
+RSM_N_SLOTS: int = 256
+
+# Cap dataset sequence length during training (model ``n_positions`` can stay 1024).
+T2_TRAIN_MAX_LENGTH: int = 512
 
 # Set by the trainer / model builder to override implicit backbone default.
 RSM_D_MODEL: Optional[int] = None

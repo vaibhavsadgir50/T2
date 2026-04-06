@@ -1,5 +1,7 @@
 """
 T2 V1 — RSM+ERG memory in place of transformer attention (DialoGPT-small scale).
+
+Training: use ``train_colab.ipynb`` (all training code is in the notebook; no ``train.py``).
 """
 
 from .config import (
@@ -16,6 +18,7 @@ from .config import (
     RSM_MAX_D_MODEL,
     RSM_N_SLOTS,
     RSM_SLOT_EMA,
+    T2_TRAIN_MAX_LENGTH,
     VOCAB_SIZE,
     erg_ffn_hidden_dim,
     resolve_rsm_d_model,
@@ -39,6 +42,7 @@ __all__ = [
     "N_INNER",
     "VOCAB_SIZE",
     "RSM_N_SLOTS",
+    "T2_TRAIN_MAX_LENGTH",
     "RSM_D_MODEL",
     "RSM_MAX_D_MODEL",
     "RSM_BETA",
