@@ -13,10 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dpnn.erg_reasoning import ExplicitReasoningGraph
-
 from . import config as C
-from .erg_markov import erg_anchor_slots_forward
+from .erg_markov import MarkovERG, erg_anchor_slots_forward
 
 
 def _resolve_slot_ema(explicit: Optional[float]) -> float:
@@ -70,7 +68,7 @@ class GeometricResonantStateMemory(nn.Module):
         self.query_proj = nn.Linear(rd, rd)
         self.value_proj = nn.Linear(rd, rd)
         self.output_proj = nn.Linear(rd, rd)
-        self.erg = ExplicitReasoningGraph(rd, efd, est)
+        self.erg = MarkovERG(rd, n_steps=est, ffn_dim=efd)
         self.register_buffer("state", torch.zeros(ns, rd))
         self._init_weights()
 

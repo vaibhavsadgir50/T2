@@ -1,103 +1,139 @@
 """
-O(B × N) ERG-style geometric pass: anchor token + all slot vectors.
+Markov-chain reasoning over RSM slots (NTM-style controller).
 
-Full ``ExplicitReasoningGraph`` uses all node pairs (O(k²)). Here node 0 is
-the anchor (incoming token); nodes 1..N-1 are RSM slots. For each slot we form
-one (receiver=anchor, sender=slot) pair, apply the same five ERG primitives and
-router, then aggregate slot messages with softmax attention from the anchor.
-
-Input:  (B, N, d_model) with N = 1 + n_slots — [:,0] token, [:,1:] slots.
-Output: (B, d_model) — refined token after ``ERG_N_STEPS`` anchor iterations.
+Softmax attention from the anchor onto slots is the transition distribution; each
+step gated-mixes the anchor toward the expected slot context and refines with an FFN.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-from dpnn.erg_reasoning import ExplicitReasoningGraph
-
-from .config import ERG_N_STEPS
-
-
-def _erg_anchor_slot_step(
-    erg: ExplicitReasoningGraph,
-    h0: torch.Tensor,
-    slots: torch.Tensor,
-) -> torch.Tensor:
+class MarkovERG(nn.Module):
     """
-    One refinement step: O(B × S) in slot count S = N - 1.
+    Reasoning engine: ``n_steps`` iterations of transition → context → gate → FFN.
 
-    Args:
-        erg:   shared ``ExplicitReasoningGraph`` modules (pair_proj, ops, …).
-        h0:    (B, d_model) anchor (token).
-        slots: (B, S, d_model) slot rows (not mutated).
-
-    Returns:
-        (B, d_model) updated anchor.
+    The Markov transition is ``softmax(q @ slots^T / sqrt(d))`` with
+    ``q = transition_proj(norm1(anchor))``, i.e. a learned query direction in slot space.
     """
-    B, S, d_model = slots.shape
-    # Receiver = anchor, sender = slot — matches ERG pair layout cat(h_recv, h_send).
-    h_recv = h0.unsqueeze(1).expand(-1, S, -1)
-    pairs = torch.cat([h_recv, slots], dim=-1)
 
-    pair_feat = erg.pair_proj(pairs)
-    op_w = F.softmax(erg.op_scorer(pair_feat), dim=-1)
+    def __init__(
+        self,
+        d_model: int,
+        n_steps: int = 6,
+        ffn_dim: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        if ffn_dim is None:
+            ffn_dim = max(1, 4 * d_model)
+        self.d_model = d_model
+        self.n_steps = int(n_steps)
+        self.ffn_dim = int(ffn_dim)
 
-    m0 = erg.op_compose(pairs)
-    m1 = erg.op_compare(pairs)
-    m2 = erg.op_negate(h_recv)
-    m3 = erg.op_generalise(pairs)
-    m4 = erg.op_instantiate(pairs)
-    ops = torch.stack([m0, m1, m2, m3, m4], dim=2)
-    msgs = (op_w.unsqueeze(-1) * ops).sum(dim=2)
+        self.transition_proj = nn.Linear(d_model, d_model)
+        self.gate = nn.Linear(d_model * 2, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, self.ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(self.ffn_dim, d_model),
+        )
+        self._init_weights()
 
-    scale = d_model ** -0.5
-    attn_logits = (h0.unsqueeze(1) * slots).sum(dim=-1) * scale
-    attn = F.softmax(attn_logits, dim=-1)
-    msg_agg = (attn.unsqueeze(-1) * msgs).sum(dim=1)
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.transition_proj.weight)
+        nn.init.zeros_(self.transition_proj.bias)
+        nn.init.xavier_uniform_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        for m in self.ffn:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    h_new = erg.update_proj(torch.cat([h0, msg_agg], dim=-1))
-    h0 = erg.norm1(h_new) + h0
-    h0 = h0 + erg.ffn(erg.norm2(h0))
-    return h0
+    def forward(
+        self,
+        anchor: torch.Tensor,
+        slots: torch.Tensor,
+        n_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            anchor: ``(B, d_model)`` query / token state.
+            slots: ``(B, n_slots, d_model)`` RSM memory (not modified).
+
+        Returns:
+            ``(B, d_model)`` anchor after ``n_steps`` reasoning steps.
+        """
+        if anchor.dim() != 2 or slots.dim() != 3:
+            raise ValueError(
+                f"anchor must be (B, d), slots (B, S, d); got {anchor.shape}, {slots.shape}"
+            )
+        B, d_a = anchor.shape
+        Bs, S, d_s = slots.shape
+        if B != Bs or d_a != self.d_model or d_s != self.d_model:
+            raise ValueError(
+                f"shape mismatch: anchor {anchor.shape}, slots {slots.shape}, "
+                f"d_model={self.d_model}"
+            )
+
+        steps = self.n_steps if n_steps is None else int(n_steps)
+        scale = self.d_model ** -0.5
+        h = anchor
+
+        for _ in range(steps):
+            q = self.transition_proj(self.norm1(h))
+            logits = torch.bmm(q.unsqueeze(1), slots.transpose(1, 2)).squeeze(1) * scale
+            scores = F.softmax(logits, dim=-1)
+            context = torch.bmm(scores.unsqueeze(1), slots).squeeze(1)
+
+            gate_in = torch.cat([h, context], dim=-1)
+            g = torch.sigmoid(self.gate(gate_in))
+            h = h * (1.0 - g) + context * g
+            h = h + self.ffn(self.norm2(h))
+
+        return h
+
+
+def build_markov_erg(
+    d_model: int,
+    n_steps: int = 6,
+    ffn_dim: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+) -> MarkovERG:
+    m = MarkovERG(d_model, n_steps=n_steps, ffn_dim=ffn_dim)
+    if device is not None:
+        m = m.to(device)
+    return m
 
 
 def erg_anchor_slots_forward(
-    erg: ExplicitReasoningGraph,
+    erg: MarkovERG,
     nodes: torch.Tensor,
     n_steps: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Geometric pass: anchor token with full slot context, linear in slot count.
+    Compatibility wrapper: ``nodes[:, 0]`` = anchor, ``nodes[:, 1:]`` = slots.
 
     Args:
-        erg:    ``ExplicitReasoningGraph`` (``d_model`` must match ``nodes``).
-        nodes:  (B, N, d_model) with ``N == 1 + n_slots``.
-                ``nodes[:, 0]`` — new token; ``nodes[:, 1:]`` — current slots.
-        n_steps: override default from :data:`T2.config.ERG_N_STEPS`.
-
-    Returns:
-        (B, d_model) transformed token (node 0) after all steps.
-
-    Complexity: ``O(n_steps × B × N × d_model²)`` from linears; **linear in N**,
-    not quadratic in N (no all-pairs graph).
+        erg: ``MarkovERG`` instance.
+        nodes: ``(B, 1 + n_slots, d_model)``.
+        n_steps: if ``None``, uses ``erg.n_steps``; else overrides step count for this call.
     """
+    if not isinstance(erg, MarkovERG):
+        raise TypeError(f"erg must be MarkovERG, got {type(erg).__name__}")
     if nodes.dim() != 3:
         raise ValueError(f"nodes must be (B, N, d), got shape {tuple(nodes.shape)}")
     B, N, d_model = nodes.shape
     if N < 2:
-        raise ValueError(
-            f"need N >= 2 (token + at least one slot), got N={N}"
-        )
-    steps = ERG_N_STEPS if n_steps is None else int(n_steps)
+        raise ValueError(f"need N >= 2 (anchor + slots), got N={N}")
+    if d_model != erg.d_model:
+        raise ValueError(f"nodes d_model {d_model} != erg.d_model {erg.d_model}")
 
-    h0 = nodes[:, 0, :].contiguous()
+    anchor = nodes[:, 0, :].contiguous()
     slots = nodes[:, 1:, :].contiguous()
-
-    for _ in range(steps):
-        h0 = _erg_anchor_slot_step(erg, h0, slots)
-
-    return h0
+    return erg.forward(anchor, slots, n_steps=n_steps)
