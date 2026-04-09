@@ -3,6 +3,18 @@ T2 — Conversation RSM: write → think (ERG) → read (attention).
 
 **think** runs multiple ERG anchor passes over slots (and optional domain nodes),
 refining a conclusion vector before **read** applies softmax attention over slots only.
+
+Parallel path (write_parallel / think_parallel / read_parallel):
+  Replaces the per-token sequential loop with a chunked prefix-scan EMA write and
+  batched ERG think/read over the full sequence. This eliminates the O(T) sequential
+  CUDA-kernel launches that cause OOM on T4 / A100 for long sequences.
+
+  Write recurrence (per slot s):
+      state[t, s] = (1-α) * state[t-1, s] + α * w[t, s] * v[t]
+  where w[t, s] = softmax(query_proj(norm1(h[t])) @ state0.T)[s].
+  Routing uses the *initial* state (state0) to break the sequential dependency.
+  The recurrence has a constant decay coefficient a = 1-α, enabling a parallel
+  prefix-scan via cumsum within chunks of size ≤ 128 tokens (safe in float32).
 """
 
 from __future__ import annotations
@@ -15,6 +27,8 @@ import torch.nn.functional as F
 
 from . import config as C
 from .erg_markov import MarkovERG, build_markov_erg, erg_anchor_slots_forward  # noqa: F401
+
+_NORMALIZE_EPS: float = 1e-8  # guard for all F.normalize calls
 
 
 def _resolve_slot_ema(explicit: Optional[float]) -> float:
@@ -192,6 +206,141 @@ class GeometricResonantStateMemory(nn.Module):
         """Domain-style read from token slice: ``read(query_proj(norm1(x)), state)``."""
         q = self.query_proj(self.norm1(x))
         return self.read(q, state)
+
+    # ------------------------------------------------------------------
+    # Parallel path — processes full (B, T, d) sequence at once
+    # ------------------------------------------------------------------
+
+    def write_parallel(
+        self,
+        h: torch.Tensor,
+        state0: torch.Tensor,
+        chunk_size: int = 128,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Soft-routed parallel EMA write over a full token sequence.
+
+        Recurrence per slot s:
+            state[t, s] = (1-α) * state[t-1, s] + α * w[t, s] * v[t]
+        Routing weights w are computed from token queries against ``state0`` (the
+        initial state), breaking the sequential state dependency.  The constant
+        decay coefficient a = 1-α enables a parallel prefix-scan via torch.cumsum
+        within chunks of at most ``chunk_size`` tokens.
+
+        Args:
+            h:          ``(B, T, d_model)`` — token embeddings (pre-embedded).
+            state0:     ``(B, n_slots, d_model)`` — initial slot state.
+            chunk_size: tokens per chunk for the prefix scan (≤128 is safe in
+                        float32; larger values risk a^(-t) overflow).
+
+        Returns:
+            states:      ``(B, T, n_slots, d_model)`` — slot state *after* each write.
+            final_state: ``(B, n_slots, d_model)`` — state after the last token.
+        """
+        B, T, d = h.shape
+        S = self.n_slots
+        alpha = self.slot_ema
+        a = 1.0 - alpha
+
+        # --- value and routing query — fully parallel ---
+        h_flat = h.reshape(B * T, d)
+        h_norm = self.norm1(h_flat).reshape(B, T, d)
+        v = self.value_proj(h_norm)   # (B, T, d)
+        q = self.query_proj(h_norm)   # (B, T, d)
+
+        # Routing weights: softmax(q @ state0^T / scale)   shape: (B, T, S)
+        scale = self.read_logit_scale * (d ** -0.5)
+        scores = torch.bmm(q, state0.transpose(1, 2)) * scale  # (B, T, S)
+        w = F.softmax(scores, dim=-1)                           # (B, T, S)
+
+        # Per-slot write input: u[t, s] = α * w[t, s] * v[t]   shape: (B, T, S, d)
+        u = alpha * w.unsqueeze(-1) * v.unsqueeze(2)
+
+        # --- chunked cumsum prefix scan ---
+        # Within chunk of length C, with constant decay a:
+        #   state[t] = a^(t+1) * state_prev + a^t * cumsum(u[k] * a^(-k))[t]
+        # chunk_size ≤ 128 keeps a^(-127) ≤ ~1.7e5 for a=0.9, safe in float32.
+        all_chunks: List[torch.Tensor] = []
+        state = state0
+
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            u_c = u[:, start:end]            # (B, C, S, d)
+            C = end - start
+
+            t_idx = torch.arange(C, device=h.device, dtype=h.dtype)
+            decay = a ** t_idx               # (C,) — a^0 … a^(C-1)
+            inv_decay = 1.0 / decay.clamp(min=1e-30)
+
+            # Scale, cumsum, then rescale
+            cs = torch.cumsum(u_c * inv_decay.view(1, C, 1, 1), dim=1)  # (B, C, S, d)
+
+            # state[t] = a^t * cs[t] + a^(t+1) * state_prev
+            t1_decay = a ** (t_idx + 1)      # a^1 … a^C
+            chunk_states = (
+                decay.view(1, C, 1, 1) * cs
+                + t1_decay.view(1, C, 1, 1) * state.unsqueeze(1)
+            )                                # (B, C, S, d)
+
+            all_chunks.append(chunk_states)
+            state = chunk_states[:, -1]      # carry state to next chunk
+
+        states = torch.cat(all_chunks, dim=1)   # (B, T, S, d)
+        return states, state
+
+    def think_parallel(
+        self,
+        h: torch.Tensor,
+        states: torch.Tensor,
+        n_steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Batched ERG think over a full sequence.
+
+        Args:
+            h:      ``(B, T, d_model)`` — token embeddings.
+            states: ``(B, T, n_slots, d_model)`` — per-token slot states
+                    (e.g. from ``write_parallel``).
+
+        Returns:
+            ``(B, T, d_model)`` — ERG-refined query vectors.
+        """
+        B, T, d = h.shape
+        BT = B * T
+        h_flat = h.reshape(BT, d)
+        anchors = self.query_proj(self.norm1(h_flat))   # (B*T, d)
+        slots = states.reshape(BT, self.n_slots, d)
+        steps = self.erg_n_steps if n_steps is None else int(n_steps)
+        q_erg = self.erg.forward(anchors, slots, n_steps=steps)  # (B*T, d)
+        return q_erg.reshape(B, T, d)
+
+    def read_parallel(
+        self,
+        q: torch.Tensor,
+        states: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Batched softmax slot-attention read over a full sequence.
+
+        Args:
+            q:      ``(B, T, d_model)`` — query vectors (e.g. from ``think_parallel``).
+            states: ``(B, T, n_slots, d_model)`` — per-token slot states.
+
+        Returns:
+            ``(B, T, d_model)`` — context vectors.
+        """
+        B, T, d = q.shape
+        BT = B * T
+        slots = states.reshape(BT, self.n_slots, d)
+        scale = self.read_logit_scale * (d ** -0.5)
+        logits = torch.bmm(q.reshape(BT, 1, d), slots.transpose(1, 2)).squeeze(1) * scale
+        attn = F.softmax(logits, dim=-1)                    # (B*T, S)
+        ctx = torch.bmm(attn.unsqueeze(1), slots).squeeze(1)  # (B*T, d)
+        return ctx.reshape(B, T, d)
+
+    # ------------------------------------------------------------------
+    # Legacy single-step path
+    # ------------------------------------------------------------------
 
     def memory_step_batched(
         self,

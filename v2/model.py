@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from . import config as C
 from .geometric_memory import GeometricResonantStateMemory
@@ -110,6 +111,55 @@ class GPT2RSMBlock(nn.Module):
             self.domain_proj = nn.Linear(self.n_embd, self.n_embd)
             nn.init.xavier_uniform_(self.domain_proj.weight)
             nn.init.zeros_(self.domain_proj.bias)
+
+    def forward_parallel(
+        self,
+        h: torch.Tensor,
+        conv_state: torch.Tensor,
+        domain_states: List[torch.Tensor],
+        use_grad_checkpoint: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """
+        Full-sequence parallel forward — no per-token Python loop.
+
+        Replaces the ``write_step`` / ``think`` / ``read`` per-token loop with:
+          1. ``write_parallel``  — chunked prefix-scan EMA over all T tokens at once.
+          2. ``think_parallel``  — batched ERG over (B*T, n_slots) in one kernel.
+          3. ``read_parallel``   — batched softmax attention over (B*T, n_slots).
+
+        Domain RSMs are not yet supported in the parallel path (they fall back to
+        zero context for the ERG extra_node slot, identical to V1 behaviour).
+
+        Args:
+            h:                   ``(B, T, d_model)`` — embeddings from previous layer.
+            conv_state:          ``(B, n_slots, d_model)`` — initial slot state.
+            domain_states:       per-domain slot states (passed through unchanged).
+            use_grad_checkpoint: wrap the ERG think in gradient checkpointing to
+                                 trade compute for memory on long sequences.
+
+        Returns:
+            h_out:      ``(B, T, d_model)``
+            final_conv: ``(B, n_slots, d_model)``
+            domain_states: unchanged list (domain parallel path not yet built)
+        """
+        # 1. Parallel EMA write — produces per-token states
+        all_states, final_conv = self.conv_rsm.write_parallel(h, conv_state)
+
+        # 2. ERG think — batched over B*T
+        if use_grad_checkpoint:
+            def _think(h_: torch.Tensor, s_: torch.Tensor) -> torch.Tensor:
+                return self.conv_rsm.think_parallel(h_, s_)
+            q_erg = grad_checkpoint(_think, h, all_states, use_reentrant=False)
+        else:
+            q_erg = self.conv_rsm.think_parallel(h, all_states)   # (B, T, d)
+
+        # 3. Slot attention read
+        ctx = self.conv_rsm.read_parallel(q_erg, all_states)      # (B, T, d)
+
+        # 4. Residual + MLP
+        h = h + self.out_proj(ctx)
+        h = h + self.mlp(self.ln_2(h))
+        return h, final_conv, domain_states
 
     def forward_step(
         self,
@@ -272,7 +322,20 @@ class GPT2RSMModel(nn.Module):
         labels: Optional[torch.Tensor] = None,
         compute_aux_losses: bool = False,
         extra_nodes: Optional[torch.Tensor] = None,
+        sequential: bool = False,
+        use_grad_checkpoint: bool = False,
     ) -> dict[str, Any]:
+        """
+        Args:
+            sequential:          If ``True``, use the original per-token loop (correct
+                                 but OOM on T4 for long sequences).  If ``False``
+                                 (default), use the parallel prefix-scan path which
+                                 processes all T tokens per layer in one pass — no
+                                 O(T) sequential CUDA kernel launches.
+            use_grad_checkpoint: Only applies to the parallel path.  Wraps the ERG
+                                 think step in gradient checkpointing to trade compute
+                                 for memory (useful on A100 while parallel scan ships).
+        """
         B, T = input_ids.shape
         if T > self.cfg.n_positions:
             raise ValueError(
@@ -285,6 +348,35 @@ class GPT2RSMModel(nn.Module):
         h = self.drop(h)
 
         conv_states, domain_states = self.init_states(B, device, dtype)
+
+        # ------------------------------------------------------------------ #
+        # Parallel path — O(log T) prefix scan, no per-token Python loop      #
+        # ------------------------------------------------------------------ #
+        if not sequential:
+            for i, block in enumerate(self.blocks):
+                h, conv_states[i], domain_states[i] = block.forward_parallel(
+                    h,
+                    conv_states[i],
+                    domain_states[i],
+                    use_grad_checkpoint=use_grad_checkpoint,
+                )
+            h_out = self.ln_f(h)
+            logits = self.lm_head(h_out)
+            result: dict[str, Any] = {"logits": logits}
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                result["loss"] = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    ignore_index=-100,
+                )
+            return result
+
+        # ------------------------------------------------------------------ #
+        # Sequential path — original per-token loop (kept for correctness    #
+        # verification and single-token inference)                            #
+        # ------------------------------------------------------------------ #
         out = torch.empty_like(h)
 
         sum_consistency = h.new_zeros(())
@@ -330,7 +422,7 @@ class GPT2RSMModel(nn.Module):
 
         h_out = self.ln_f(out)
         logits = self.lm_head(h_out)
-        result: dict[str, Any] = {"logits": logits}
+        result = {"logits": logits}
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
